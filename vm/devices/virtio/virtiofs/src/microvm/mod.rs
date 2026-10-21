@@ -18,6 +18,7 @@ pub(crate) mod owner;
 #[cfg(test)]
 mod owner_tests;
 pub(crate) mod policy;
+pub(crate) mod poc_live;
 #[cfg(test)]
 mod policy_tests;
 pub mod profile;

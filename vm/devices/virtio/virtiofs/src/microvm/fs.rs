@@ -6,8 +6,12 @@
 use super::MAX_FUSE_REQUEST_BYTES;
 use super::owner::CallerIdentity;
 use super::policy::SubtreePolicy;
+use super::profile::MICROVM_AGGREGATE_MAX_CHILDREN;
+use super::profile::MicroVmAggregateChild;
 use super::profile::MicroVmOwnerMode;
 use super::profile::MicroVmVirtioFsProfile;
+use super::profile::microvm_file_identity;
+use super::profile::microvm_root_identity;
 use super::saved_state::MAX_ALIAS_BYTES;
 use super::saved_state::MAX_ALIASES;
 use super::saved_state::MAX_ALIASES_PER_INODE;
@@ -327,6 +331,105 @@ impl VirtioFs {
         })
     }
 
+    /// Adds a child to a running microVM aggregate, so that the guest can
+    /// look `name` up under the synthetic root and bind it, without a restart.
+    ///
+    /// The child goes through the checks and the strict, policy-enforcing
+    /// volume of a child that was fixed at creation. `file` selects a regular
+    /// host file in place of a directory, and the policy paths apply only to a
+    /// directory. The host root may back only one child. Caller ownership
+    /// squashes guest root to the one owner of every child root, which a later
+    /// child cannot be checked against, so it refuses runtime children.
+    ///
+    /// A child added here is not part of the profile that a snapshot records,
+    /// so the aggregate can no longer be captured once it has one.
+    pub fn add_microvm_child(
+        &self,
+        name: &str,
+        root_path: impl AsRef<Path>,
+        read_only: bool,
+        file: bool,
+        denied_paths: Vec<String>,
+        allowed_paths: Vec<String>,
+        writable_paths: Vec<String>,
+    ) -> anyhow::Result<()> {
+        let root_path = root_path.as_ref();
+        let profile = self
+            .microvm_profile()
+            .context("runtime children need a microVM filesystem")?;
+        anyhow::ensure!(
+            profile.is_aggregate(),
+            "runtime children need a microVM aggregate"
+        );
+        let aggregate = self
+            .inner
+            .aggregate()
+            .context("runtime children need a microVM aggregate")?;
+        anyhow::ensure!(
+            profile.owner_mode() == MicroVmOwnerMode::Vmm,
+            "a microVM aggregate with caller ownership takes no runtime children"
+        );
+        let identity = if file {
+            microvm_file_identity(root_path)?
+        } else {
+            microvm_root_identity(root_path)?
+        };
+        let child = if file {
+            MicroVmAggregateChild::new_file(name.to_owned(), identity.clone(), read_only)?
+        } else {
+            MicroVmAggregateChild::new(
+                name.to_owned(),
+                identity.clone(),
+                read_only,
+                denied_paths,
+                allowed_paths,
+                writable_paths,
+            )?
+        };
+        child
+            .validate_root_path(root_path)
+            .with_context(|| format!("microVM aggregate child '{name}'"))?;
+        let static_identities: Vec<&[u8]> = profile
+            .children()
+            .iter()
+            .map(MicroVmAggregateChild::root_identity)
+            .collect();
+        aggregate.add_dynamic_child(
+            name,
+            &identity,
+            &static_identities,
+            MICROVM_AGGREGATE_MAX_CHILDREN,
+            |volume_id| {
+                let (volume, _, root_stat) = open_microvm_volume(
+                    root_path,
+                    child.is_readonly(),
+                    child.subtree_policy(),
+                    volume_id,
+                    child.is_file(),
+                )?;
+                child
+                    .validate_opened_root(root_path, &root_stat)
+                    .with_context(|| format!("microVM aggregate child '{name}'"))?;
+                Ok(volume)
+            },
+        )
+    }
+
+    /// Removes a child that [`Self::add_microvm_child`] added. The guest must
+    /// have unmounted it first; inodes beneath it stay valid until the guest
+    /// forgets them. Returns `ENOENT` if there is no such child and `EINVAL`
+    /// for a child that was fixed at creation or on a filesystem that is not a
+    /// microVM aggregate.
+    pub fn remove_microvm_child(&self, name: &str) -> lx::Result<()> {
+        if !self.is_microvm() {
+            return Err(lx::Error::EINVAL);
+        }
+        let Some(aggregate) = self.inner.aggregate() else {
+            return Err(lx::Error::EINVAL);
+        };
+        aggregate.remove_dynamic_child(name)
+    }
+
     pub(crate) fn microvm_profile(&self) -> Option<&MicroVmVirtioFsProfile> {
         self.inner.microvm_profile.as_ref()
     }
@@ -418,6 +521,12 @@ impl VirtioFs {
         anyhow::ensure!(
             self.inner.aggregate().is_some() == profile.is_aggregate(),
             "virtio-fs attachment layout does not match the microVM profile"
+        );
+        anyhow::ensure!(
+            self.inner
+                .aggregate()
+                .is_none_or(|aggregate| !aggregate.has_dynamic_children()),
+            "a microVM aggregate that took runtime children cannot be captured"
         );
 
         let (inodes, node_ids, next_node_id) = {
