@@ -37,6 +37,10 @@ struct ChildEntry {
     /// target path.
     name: String,
     volume: Arc<VirtioFsVolume>,
+    /// The identity of the host root of a microVM child that was added at
+    /// runtime, or `None` for a child that was fixed when the aggregate was
+    /// created.
+    dynamic_identity: Option<Vec<u8>>,
 }
 
 /// Registry of aggregated children for an aggregate-mode [`VirtioFs`].
@@ -44,6 +48,10 @@ struct AggregateRegistry {
     entries: Vec<ChildEntry>,
     next_volume_id: u32,
     tearing_down: bool,
+    /// Whether a microVM child was ever added at runtime. Such a child is not
+    /// part of the profile that a snapshot records, so the aggregate can no
+    /// longer be captured.
+    dynamic_ever: bool,
 }
 
 impl AggregateRegistry {
@@ -54,6 +62,7 @@ impl AggregateRegistry {
             entries: Vec::new(),
             next_volume_id: 1,
             tearing_down: false,
+            dynamic_ever: false,
         }
     }
 
@@ -93,7 +102,11 @@ impl AggregateState {
                 "aggregate child volume IDs must follow child order"
             );
             registry.next_volume_id = volume.id().saturating_add(1);
-            registry.entries.push(ChildEntry { name, volume });
+            registry.entries.push(ChildEntry {
+                name,
+                volume,
+                dynamic_identity: None,
+            });
         }
         Self {
             registry: RwLock::new(registry),
@@ -108,6 +121,95 @@ impl AggregateState {
             .iter()
             .map(|entry| Arc::clone(&entry.volume))
             .collect()
+    }
+
+    /// Returns whether a microVM child was ever added at runtime.
+    pub(crate) fn has_dynamic_children(&self) -> bool {
+        self.registry.read().dynamic_ever
+    }
+
+    /// Appends a microVM child at runtime and returns once the guest can look
+    /// it up under the synthetic root.
+    ///
+    /// `identity` is the identity of the child's host root and
+    /// `static_identities` are those of the children that were fixed when the
+    /// aggregate was created; a host root may back only one child. `build`
+    /// opens the child's volume as the volume ID that it receives. It runs
+    /// under the registry's write lock, so that a concurrent addition cannot
+    /// take the ID, and a lookup in the synthetic root waits for it.
+    pub(crate) fn add_dynamic_child(
+        &self,
+        name: &str,
+        identity: &[u8],
+        static_identities: &[&[u8]],
+        max_children: usize,
+        build: impl FnOnce(u32) -> anyhow::Result<Arc<VirtioFsVolume>>,
+    ) -> anyhow::Result<()> {
+        let mut registry = self.registry.write();
+        registry
+            .check_can_add()
+            .map_err(|_| anyhow::anyhow!("the aggregate is tearing down"))?;
+        anyhow::ensure!(
+            registry.entries.len() < max_children,
+            "the microVM aggregate already has {max_children} children"
+        );
+        anyhow::ensure!(
+            !registry.entries.iter().any(|e| e.name == name),
+            "the microVM aggregate already has a child named '{name}'"
+        );
+        anyhow::ensure!(
+            !static_identities.contains(&identity)
+                && !registry
+                    .entries
+                    .iter()
+                    .any(|e| e.dynamic_identity.as_deref() == Some(identity)),
+            "the host root of child '{name}' already backs another child"
+        );
+        let volume_id = registry.next_volume_id;
+        let next_volume_id = volume_id
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("the aggregate's volume IDs are exhausted"))?;
+        let volume = build(volume_id)?;
+        anyhow::ensure!(
+            volume.id() == volume_id,
+            "the opened child volume has an unexpected ID"
+        );
+        registry.next_volume_id = next_volume_id;
+        registry.dynamic_ever = true;
+        registry.entries.push(ChildEntry {
+            name: name.to_string(),
+            volume,
+            dynamic_identity: Some(identity.to_vec()),
+        });
+        tracing::info!(
+            name,
+            volume_id,
+            child_count = registry.entries.len(),
+            "added microVM aggregate virtio-fs child at runtime"
+        );
+        Ok(())
+    }
+
+    /// Removes a microVM child that was added at runtime. Returns `ENOENT` if
+    /// there is no such child and `EINVAL` for a child that was fixed when the
+    /// aggregate was created.
+    pub(crate) fn remove_dynamic_child(&self, name: &str) -> lx::Result<()> {
+        let mut registry = self.registry.write();
+        match registry.entries.iter().position(|e| e.name == name) {
+            None => Err(lx::Error::ENOENT),
+            Some(index) if registry.entries[index].dynamic_identity.is_none() => {
+                Err(lx::Error::EINVAL)
+            }
+            Some(index) => {
+                registry.entries.remove(index);
+                tracing::info!(
+                    name,
+                    child_count = registry.entries.len(),
+                    "removed microVM aggregate virtio-fs child at runtime"
+                );
+                Ok(())
+            }
+        }
     }
 }
 
@@ -163,6 +265,7 @@ impl VirtioFs {
         registry.entries.push(ChildEntry {
             name: name.to_string(),
             volume: Arc::new(VirtioFsVolume::new(volume, volume_id, readonly)),
+            dynamic_identity: None,
         });
         tracing::info!(
             name,
