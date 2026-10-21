@@ -125,6 +125,7 @@ impl VirtioFsDevice {
         let profile = MicroVmVirtioFsProfile::from_aggregate(stable_id, children)?
             .with_owner_mode(owner_mode)?;
         let fs = VirtioFs::new_microvm_aggregate(root_paths, profile.clone())?;
+        super::poc_live::start_if_enabled(&fs);
         Self::new_microvm(driver_source, profile, fs, notify_corruption)
     }
 }

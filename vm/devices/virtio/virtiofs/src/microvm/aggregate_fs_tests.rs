@@ -195,6 +195,103 @@ fn synthetic_root_lists_only_the_children_and_refuses_changes() {
 }
 
 #[test]
+fn children_can_be_added_and_removed_at_runtime() {
+    let roots = Roots::new();
+    let fs = aggregate(&[Child::new("work", &roots.work, false)]);
+    let root = FUSE_ROOT_ID;
+    assert_eq!(list(&fs, root), ["work"]);
+    assert_eq!(error(lookup(&fs, "tools")), lx::Error::ENOENT);
+
+    // A read-only child that arrives after the guest is running is visible to
+    // its next lookup and listing, with the strict volume of a fixed child.
+    fs.add_microvm_child("tools", &roots.tools, true, false, vec![], vec![], vec![])
+        .unwrap();
+    assert_eq!(list(&fs, root), ["tools", "work"]);
+    let tools = lookup(&fs, "tools").unwrap();
+    assert_eq!(list(&fs, tools), ["file"]);
+    assert_eq!(read_node(&fs, lookup(&fs, "tools/file").unwrap()), b"host");
+    assert_eq!(error(create(&fs, tools, "new")), lx::Error::EROFS);
+    assert_eq!(Roots::entries(&roots.tools), ["file"]);
+
+    // Fixed children stay fixed, and a name or a host root backs one child.
+    assert_eq!(fs.remove_microvm_child("work").unwrap_err(), lx::Error::EINVAL);
+    assert_eq!(
+        fs.remove_microvm_child("missing").unwrap_err(),
+        lx::Error::ENOENT
+    );
+    fs.add_microvm_child("tools", &roots.tools, true, false, vec![], vec![], vec![])
+        .unwrap_err();
+    fs.add_microvm_child("again", &roots.tools, true, false, vec![], vec![], vec![])
+        .unwrap_err();
+    fs.add_microvm_child("fixed", &roots.work, false, false, vec![], vec![], vec![])
+        .unwrap_err();
+    assert_eq!(list(&fs, root), ["tools", "work"]);
+
+    // The generic entry points still refuse a microVM aggregate.
+    assert_eq!(
+        fs.add_child("more", &roots.work, None).unwrap_err(),
+        lx::Error::EINVAL
+    );
+    assert_eq!(fs.remove_child("tools").unwrap_err(), lx::Error::EINVAL);
+
+    // Removal hides the name from new lookups; the root can back a new child.
+    fs.remove_microvm_child("tools").unwrap();
+    assert_eq!(list(&fs, root), ["work"]);
+    assert_eq!(error(lookup(&fs, "tools")), lx::Error::ENOENT);
+    fs.add_microvm_child("tools2", &roots.tools, true, false, vec![], vec![], vec![])
+        .unwrap();
+    assert_eq!(list(&fs, root), ["tools2", "work"]);
+    assert_eq!(read_node(&fs, lookup(&fs, "tools2/file").unwrap()), b"host");
+}
+
+#[test]
+fn runtime_children_enforce_their_policy_and_block_capture() {
+    let roots = Roots::new();
+    std::fs::create_dir(roots.tools.join("secret")).unwrap();
+    std::fs::create_dir(roots.tools.join("out")).unwrap();
+    let children = [Child::new("work", &roots.work, false)];
+    let fs = aggregate(&children);
+    fs.add_microvm_child(
+        "tools",
+        &roots.tools,
+        false,
+        false,
+        owned(&["secret"]),
+        vec![],
+        owned(&["out"]),
+    )
+    .unwrap();
+
+    assert_eq!(error(lookup(&fs, "tools/secret")), lx::Error::EACCES);
+    let tools = lookup(&fs, "tools").unwrap();
+    assert_eq!(error(create(&fs, tools, "new")), lx::Error::EROFS);
+    let out = lookup(&fs, "tools/out").unwrap();
+    let (file, fh) = create(&fs, out, "made").unwrap();
+    write(&fs, file, fh, b"guest").unwrap();
+    release(&fs, file, fh);
+    assert_eq!(std::fs::read(roots.tools.join("out/made")).unwrap(), b"guest");
+
+    // A shared file is a child too, and exposes only itself.
+    let note = roots.work.join("file");
+    fs.add_microvm_child("note", &note, true, true, vec![], vec![], vec![])
+        .unwrap();
+    assert_eq!(read_node(&fs, lookup(&fs, "note").unwrap()), b"host");
+
+    // The profile cannot describe a runtime child, so the aggregate no longer
+    // captures; removing the child does not make it capturable again.
+    assert!(
+        fs.save_microvm_state(&profile(&children), SessionState::default())
+            .is_err()
+    );
+    fs.remove_microvm_child("tools").unwrap();
+    fs.remove_microvm_child("note").unwrap();
+    assert!(
+        fs.save_microvm_state(&profile(&children), SessionState::default())
+            .is_err()
+    );
+}
+
+#[test]
 fn children_enforce_their_own_access_modes() {
     let roots = Roots::new();
     let fs = aggregate(&[
