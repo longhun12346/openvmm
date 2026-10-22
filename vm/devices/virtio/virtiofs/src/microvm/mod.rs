@@ -17,6 +17,7 @@ mod limits;
 pub(crate) mod owner;
 #[cfg(test)]
 mod owner_tests;
+pub(crate) mod control;
 pub(crate) mod policy;
 pub(crate) mod poc_live;
 #[cfg(test)]
