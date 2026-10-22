@@ -4,18 +4,28 @@
 #![expect(missing_docs)]
 #![cfg(any(windows, target_os = "linux"))]
 
+
 mod aggregate;
+
 mod file;
+
 mod inode;
 #[cfg(test)]
+
 mod integration_tests;
+
 mod microvm;
 pub use microvm::profile;
+
 pub mod resolver;
 #[cfg(windows)]
+
 mod section;
+
 mod util;
+
 pub mod virtio;
+
 mod virtio_util;
 
 #[cfg(windows)]
@@ -1024,3 +1034,6 @@ impl InodeMap {
         self.inodes_by_key.insert(key, (root_inode, FUSE_ROOT_ID));
     }
 }
+
+/// The authenticated export control channel for microVM aggregates.
+pub use microvm::control;
