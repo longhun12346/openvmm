@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Authenticated replacement for the request-file trigger in [`super::poc_live`].
+//! The authenticated channel the launcher uses to add and remove aggregate children.
 //!
 //! The launcher hands this VMM one end of an inherited pipe and keeps the other,
 //! so possession of the pipe is the authentication: no other process can inject a

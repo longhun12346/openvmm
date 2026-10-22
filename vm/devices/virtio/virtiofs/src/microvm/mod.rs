@@ -21,7 +21,6 @@ mod owner_tests;
 /// install the inherited handle before the VM starts.
 pub mod control;
 pub(crate) mod policy;
-pub(crate) mod poc_live;
 #[cfg(test)]
 mod policy_tests;
 pub mod profile;
