@@ -484,6 +484,25 @@ mod tests {
     }
 
     #[test]
+    fn the_endpoint_flag_accepts_a_handle_or_a_pipe_name() {
+        assert_eq!(Endpoint::parse("28").unwrap(), Endpoint::Inherited(28));
+        assert_eq!(Endpoint::parse(" 28 ").unwrap(), Endpoint::Inherited(28));
+        let named = r"name=\\.\pipe\nvx-live-00000000000000ab";
+        assert_eq!(
+            Endpoint::parse(named).unwrap(),
+            Endpoint::Named(named.trim_start_matches("name=").to_owned())
+        );
+        // Neither a handle number nor a pipe path. OpenVMM only requires a pipe path:
+        // the product's naming (prefix, nonce shape) is the launcher's policy, so the
+        // transport layer must not hard-code it.
+        for text in ["", "handle=28", "name=", "abc"] {
+            assert!(Endpoint::parse(text).is_err(), "{text:?} must be refused");
+        }
+        // Any pipe path is accepted, including one this product would not generate.
+        assert!(Endpoint::parse(r"name=\\.\pipe\other").is_ok());
+    }
+
+    #[test]
     fn the_launcher_wire_vectors_parse_the_same_way() {
         // The same literals appear in `nvx-rs`'s `host::control::WIRE_VECTORS`,
         // which asserts them as encoder output, so a framing change on either side
