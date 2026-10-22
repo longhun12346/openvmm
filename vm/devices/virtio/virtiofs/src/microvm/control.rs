@@ -325,8 +325,17 @@ pub(crate) fn start_if_installed(fs: &crate::VirtioFs) {
                         }
                     },
                 };
+                // The reply is framed exactly like a request — `[u32 LE length][payload]` —
+                // because the launcher reads a length before the payload. Writing the bare
+                // line made every exchange wait for bytes that never came.
                 let line = format!("{}\n", reply(result));
-                if pipe.write_all(line.as_bytes()).is_err() {
+                let mut frame = Vec::with_capacity(4 + line.len());
+                frame.extend_from_slice(&(line.len() as u32).to_le_bytes());
+                frame.extend_from_slice(line.as_bytes());
+                if pipe.write_all(&frame).is_err() {
+                    return;
+                }
+                if pipe.flush().is_err() {
                     return;
                 }
             }
@@ -421,20 +430,48 @@ fn create_server_pipe(name: &str) -> std::io::Result<std::fs::File> {
     loop {
         // SAFETY: the handle is this pipe's server end; a null OVERLAPPED is allowed.
         if unsafe { ConnectNamedPipe(server, std::ptr::null_mut()) } != 0 {
-            return Ok(pipe);
+            break;
         }
         // SAFETY: GetLastError has no preconditions.
         let error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
         // Already connected, or a non-blocking pipe with no client yet: neither is
         // fatal, and the caller keeps serving.
         if error == windows_sys::Win32::Foundation::ERROR_PIPE_CONNECTED {
-            return Ok(pipe);
+            break;
         }
         if error != windows_sys::Win32::Foundation::ERROR_PIPE_LISTENING {
             return Err(std::io::Error::from_raw_os_error(error as i32));
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
+    // The polling mode above is only for accepting the client: leaving the handle in
+    // PIPE_NOWAIT would also make reads non-blocking, so the frame loop would see an
+    // empty pipe instead of waiting for the launcher's next request.
+    set_blocking_mode(server)?;
+    Ok(pipe)
+}
+
+/// Restores blocking reads and writes on a connected pipe.
+#[cfg(target_os = "windows")]
+#[expect(
+    unsafe_code,
+    reason = "switching the connected pipe back to blocking I/O; the handle is owned \
+              by the caller"
+)]
+fn set_blocking_mode(server: windows_sys::Win32::Foundation::HANDLE) -> std::io::Result<()> {
+    use windows_sys::Win32::System::Pipes::SetNamedPipeHandleState;
+    use windows_sys::Win32::System::Pipes::PIPE_READMODE_BYTE;
+    use windows_sys::Win32::System::Pipes::PIPE_WAIT;
+    let mut mode = PIPE_READMODE_BYTE | PIPE_WAIT;
+    // SAFETY: `server` is a connected pipe handle owned by the caller, and `mode`
+    // outlives the call.
+    if unsafe {
+        SetNamedPipeHandleState(server, &mut mode, std::ptr::null(), std::ptr::null())
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Platforms without inherited handles keep the request-file trigger only.
