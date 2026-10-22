@@ -223,8 +223,7 @@ static ENDPOINT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
 /// Installs the inherited handle for this process. Returns false when one was
 /// already installed with a different value, which would mean two mutually
 /// exclusive launch modes were requested.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn install(handle: u32) -> bool {
+pub fn install(handle: u32) -> bool {
     match ENDPOINT.set(handle) {
         Ok(()) => true,
         Err(_) => ENDPOINT.get().copied() == Some(handle),
