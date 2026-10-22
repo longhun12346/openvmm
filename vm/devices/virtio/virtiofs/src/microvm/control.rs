@@ -276,8 +276,10 @@ pub(crate) fn start_if_installed(fs: &crate::VirtioFs) {
     use std::io::Write;
 
     let Some(endpoint) = installed() else {
+        tracing::info!("virtio-fs export control: no endpoint installed");
         return;
     };
+    tracing::info!(?endpoint, "virtio-fs export control: starting the serving thread");
     let endpoint = endpoint.clone();
     let weak: std::sync::Weak<crate::VirtioFsInner> = std::sync::Arc::downgrade(&fs.inner);
     let spawned = std::thread::Builder::new()
@@ -290,6 +292,7 @@ pub(crate) fn start_if_installed(fs: &crate::VirtioFs) {
                     return;
                 }
             };
+            tracing::info!("virtio-fs export control: endpoint open, serving");
             let mut ordering: Option<Ordering> = None;
             loop {
                 let mut length = [0u8; 4];
@@ -383,18 +386,23 @@ fn create_server_pipe(name: &str) -> std::io::Result<std::fs::File> {
     use windows_sys::Win32::System::Pipes::PIPE_READMODE_BYTE;
     use windows_sys::Win32::System::Pipes::PIPE_REJECT_REMOTE_CLIENTS;
     use windows_sys::Win32::System::Pipes::PIPE_TYPE_BYTE;
-    use windows_sys::Win32::System::Pipes::PIPE_WAIT;
+    use windows_sys::Win32::System::Pipes::PIPE_NOWAIT;
 
     let wide: Vec<u16> = std::os::windows::ffi::OsStrExt::encode_wide(std::ffi::OsStr::new(name))
         .chain([0])
         .collect();
     // SAFETY: the name is NUL-terminated and a null security descriptor asks for the
     // process default, which admits this user and administrators only.
+    //
+    // `PIPE_NOWAIT` is essential: with the default wait mode the first
+    // `ConnectNamedPipe` blocks until the launcher connects, and this runs on the VM
+    // worker, so the guest's control console never accepts its agent and the VM never
+    // becomes ready. A polling loop keeps this thread from ever blocking.
     let handle = unsafe {
         CreateNamedPipeW(
             wide.as_ptr(),
             PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
-            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_NOWAIT | PIPE_REJECT_REMOTE_CLIENTS,
             1,
             65_536,
             65_536,
@@ -410,17 +418,23 @@ fn create_server_pipe(name: &str) -> std::io::Result<std::fs::File> {
         std::os::windows::io::OwnedHandle::from_raw_handle(handle as std::os::windows::io::RawHandle)
     });
     let server = pipe.as_raw_handle() as HANDLE;
-    // SAFETY: the handle is this pipe's server end; a null OVERLAPPED waits.
-    let connected = unsafe { ConnectNamedPipe(server, std::ptr::null_mut()) } != 0;
-    if !connected {
+    loop {
+        // SAFETY: the handle is this pipe's server end; a null OVERLAPPED is allowed.
+        if unsafe { ConnectNamedPipe(server, std::ptr::null_mut()) } != 0 {
+            return Ok(pipe);
+        }
         // SAFETY: GetLastError has no preconditions.
         let error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
-        // "Already connected" is success: the launcher can win the race.
-        if error != windows_sys::Win32::Foundation::ERROR_PIPE_CONNECTED {
+        // Already connected, or a non-blocking pipe with no client yet: neither is
+        // fatal, and the caller keeps serving.
+        if error == windows_sys::Win32::Foundation::ERROR_PIPE_CONNECTED {
+            return Ok(pipe);
+        }
+        if error != windows_sys::Win32::Foundation::ERROR_PIPE_LISTENING {
             return Err(std::io::Error::from_raw_os_error(error as i32));
         }
+        std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    Ok(pipe)
 }
 
 /// Platforms without inherited handles keep the request-file trigger only.
