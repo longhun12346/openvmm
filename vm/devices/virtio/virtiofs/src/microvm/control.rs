@@ -98,6 +98,8 @@ impl Ordering {
 }
 
 /// Percent-encodes a field value so spaces and newlines cannot forge fields.
+// Used by the launcher side of the channel and by the tests.
+#[cfg_attr(not(test), allow(dead_code))]
 fn encode(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.bytes() {
@@ -221,6 +223,7 @@ static ENDPOINT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
 /// Installs the inherited handle for this process. Returns false when one was
 /// already installed with a different value, which would mean two mutually
 /// exclusive launch modes were requested.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn install(handle: u32) -> bool {
     match ENDPOINT.set(handle) {
         Ok(()) => true,
@@ -233,7 +236,112 @@ pub(crate) fn installed() -> Option<u32> {
     ENDPOINT.get().copied()
 }
 
+/// Serves export requests on the installed handle, if the launcher passed one.
+///
+/// Every request is answered on the same pipe: `ok`, or `error: <reason>`. The
+/// thread exits when the launcher closes its end, so it cannot outlive the VM's
+/// owner. Nothing here authenticates the peer beyond the pipe itself; ordering and
+/// generation checks are in [`Ordering`].
+#[cfg(target_os = "windows")]
+#[expect(
+    unsafe_code,
+    reason = "adopting the inherited pipe handle the launcher passed; the handle is \
+              owned by this process for the life of the VM"
+)]
+pub(crate) fn start_if_installed(fs: &crate::VirtioFs) {
+    use std::io::Read;
+    use std::io::Write;
+    use std::os::windows::io::FromRawHandle;
+
+    let Some(handle) = installed() else {
+        return;
+    };
+    let weak: std::sync::Weak<crate::VirtioFsInner> = std::sync::Arc::downgrade(&fs.inner);
+    let spawned = std::thread::Builder::new()
+        .name("nvx-virtiofs-control".into())
+        .spawn(move || {
+            // SAFETY: the launcher passes this handle to this process exactly once
+            // and keeps the other end open for the life of the VM.
+            let mut pipe = unsafe { std::fs::File::from_raw_handle(handle as _) };
+            let mut ordering: Option<Ordering> = None;
+            loop {
+                let mut length = [0u8; 4];
+                if pipe.read_exact(&mut length).is_err() {
+                    return;
+                }
+                let length = u32::from_le_bytes(length) as usize;
+                if length == 0 || length > MAX_FRAME_BYTES {
+                    let _ = pipe.write_all(
+                        format!("{}\n", reply(Err(format!("frame length {length} is out of range"))))
+                            .as_bytes(),
+                    );
+                    return;
+                }
+                let mut payload = vec![0u8; length];
+                if pipe.read_exact(&mut payload).is_err() {
+                    return;
+                }
+                let result = match String::from_utf8(payload) {
+                    Err(_) => Err("frame is not valid UTF-8".to_owned()),
+                    Ok(text) => match parse(&text) {
+                        Err(error) => Err(error),
+                        Ok(request) => {
+                            let guard = ordering
+                                .get_or_insert_with(|| Ordering::new(request.generation));
+                            match guard.accept(request.generation, request.sequence) {
+                                Err(error) => Err(error),
+                                Ok(()) => apply(&weak, &request),
+                            }
+                        }
+                    },
+                };
+                let line = format!("{}\n", reply(result));
+                if pipe.write_all(line.as_bytes()).is_err() {
+                    return;
+                }
+            }
+        });
+    if let Err(error) = spawned {
+        tracing::error!(%error, "failed to start the virtio-fs control channel");
+    }
+}
+
+/// Platforms without inherited handles keep the request-file trigger only.
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn start_if_installed(_fs: &crate::VirtioFs) {}
+
+/// Applies one validated request to the aggregate filesystem.
+#[cfg(target_os = "windows")]
+fn apply(
+    weak: &std::sync::Weak<crate::VirtioFsInner>,
+    request: &Request,
+) -> Result<(), String> {
+    let Some(inner) = weak.upgrade() else {
+        return Err("the filesystem is gone".to_owned());
+    };
+    let fs = crate::VirtioFs { inner };
+    match request.operation {
+        Operation::Add => {
+            let is_file = std::path::Path::new(&request.host_path).is_file();
+            fs.add_microvm_child(
+                &request.child,
+                &request.host_path,
+                request.mode.is_read_only(),
+                is_file,
+                vec![],
+                vec![],
+                vec![],
+            )
+            .map_err(|error| format!("{error:#}"))
+        }
+        Operation::Remove => fs
+            .remove_microvm_child(&request.child)
+            .map_err(|error| format!("{error:?}")),
+    }
+}
+
 /// Encodes a request. Used by the launcher side and by the tests.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn encode_request(request: &Request) -> String {
     let mut line = format!(
         "gen={} seq={} session={} mount={} op={} child={}",
