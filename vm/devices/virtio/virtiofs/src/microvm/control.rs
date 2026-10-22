@@ -352,21 +352,75 @@ fn open_endpoint(endpoint: &Endpoint) -> std::io::Result<std::fs::File> {
             Ok(unsafe { std::fs::File::from_raw_handle(*handle as _) })
         }
         Endpoint::Named(name) => {
-            // The launcher creates the pipe before starting this process, but a busy
-            // scheduler can still lose that race, so retry briefly.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-            loop {
-                match std::fs::OpenOptions::new().read(true).write(true).open(name) {
-                    Ok(pipe) => return Ok(pipe),
-                    Err(error) if std::time::Instant::now() < deadline => {
-                        let _ = error;
-                        std::thread::sleep(std::time::Duration::from_millis(20));
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
+            // This process serves the channel: it creates the pipe and waits for the
+            // launcher to connect. The launcher names the pipe on the command line
+            // because it must know the name before this process starts, so the two
+            // sides agree without a handshake.
+            create_server_pipe(name)
         }
     }
+}
+
+/// Creates the pipe `name` and waits for the launcher to connect.
+///
+/// This process is the server: it reads requests and writes replies, so it must own
+/// the listening end. `FILE_FLAG_FIRST_PIPE_INSTANCE` makes a name collision fail
+/// loudly rather than silently attaching to another VM's channel.
+#[expect(
+    unsafe_code,
+    reason = "creating the named pipe this process serves the launcher on; the handle \
+              is owned by this process for the life of the VM"
+)]
+fn create_server_pipe(name: &str) -> std::io::Result<std::fs::File> {
+    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::io::FromRawHandle;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_FIRST_PIPE_INSTANCE;
+    use windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
+    use windows_sys::Win32::System::Pipes::ConnectNamedPipe;
+    use windows_sys::Win32::System::Pipes::CreateNamedPipeW;
+    use windows_sys::Win32::System::Pipes::PIPE_READMODE_BYTE;
+    use windows_sys::Win32::System::Pipes::PIPE_REJECT_REMOTE_CLIENTS;
+    use windows_sys::Win32::System::Pipes::PIPE_TYPE_BYTE;
+    use windows_sys::Win32::System::Pipes::PIPE_WAIT;
+
+    let wide: Vec<u16> = std::os::windows::ffi::OsStrExt::encode_wide(std::ffi::OsStr::new(name))
+        .chain([0])
+        .collect();
+    // SAFETY: the name is NUL-terminated and a null security descriptor asks for the
+    // process default, which admits this user and administrators only.
+    let handle = unsafe {
+        CreateNamedPipeW(
+            wide.as_ptr(),
+            PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+            1,
+            65_536,
+            65_536,
+            0,
+            std::ptr::null(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: the handle is a fresh pipe instance that nothing else owns.
+    let pipe = std::fs::File::from(unsafe {
+        std::os::windows::io::OwnedHandle::from_raw_handle(handle as std::os::windows::io::RawHandle)
+    });
+    let server = pipe.as_raw_handle() as HANDLE;
+    // SAFETY: the handle is this pipe's server end; a null OVERLAPPED waits.
+    let connected = unsafe { ConnectNamedPipe(server, std::ptr::null_mut()) } != 0;
+    if !connected {
+        // SAFETY: GetLastError has no preconditions.
+        let error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+        // "Already connected" is success: the launcher can win the race.
+        if error != windows_sys::Win32::Foundation::ERROR_PIPE_CONNECTED {
+            return Err(std::io::Error::from_raw_os_error(error as i32));
+        }
+    }
+    Ok(pipe)
 }
 
 /// Platforms without inherited handles keep the request-file trigger only.
