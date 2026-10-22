@@ -17,7 +17,9 @@ mod limits;
 pub(crate) mod owner;
 #[cfg(test)]
 mod owner_tests;
-pub(crate) mod control;
+/// The authenticated export control channel; public so the entry point can
+/// install the inherited handle before the VM starts.
+pub mod control;
 pub(crate) mod policy;
 pub(crate) mod poc_live;
 #[cfg(test)]
