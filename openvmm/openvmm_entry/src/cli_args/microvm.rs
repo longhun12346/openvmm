@@ -565,17 +565,16 @@ pub struct MicrovmCli {
     )]
     pub microvm_control_auth_timeout_ms: u64,
 
-    /// Inherited pipe handle carrying virtio-fs export requests
-    /// (`add`/`remove` of aggregate children) from the process that launched this
-    /// VMM. The parent keeps the other end, so possession of the handle is the
-    /// authentication; requests are additionally bound to a generation and a
-    /// monotonic sequence number so a replayed request is refused.
+    /// Export control endpoint for the aggregate virtio-fs device: `<digits>` is a
+    /// handle inherited from the launcher, `name=<pipe>` is a pipe this VMM connects
+    /// to. Requests carry a VM generation and a monotonic sequence number, so a
+    /// replayed request is refused.
     #[clap(
         long = "microvm-virtiofs-control",
-        value_name = "INHERIT",
+        value_name = "ENDPOINT",
         hide = true
     )]
-    pub microvm_virtiofs_control: Option<u32>,
+    pub microvm_virtiofs_control: Option<String>,
 
     /// microVM CPU profile: a pinned profile ID, `auto` (the default) to
     /// select the host's profile, falling back with a warning to a development

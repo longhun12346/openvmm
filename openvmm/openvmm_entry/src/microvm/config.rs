@@ -160,15 +160,13 @@ impl<'a> MicrovmConfigBuilder<'a> {
             None
         };
         opt.validate_control_stdin_console(console.as_ref().map(|(config, _, _)| config))?;
-        // Adopt the inherited export-control handle before any device is built: the
+        // Adopt the export-control endpoint before any device is built: the
         // virtio-fs device picks it up when it is constructed.
         if active
-            && let Some(handle) = opt.microvm.microvm_virtiofs_control
+            && let Some(spec) = opt.microvm.microvm_virtiofs_control.as_deref()
         {
-            anyhow::ensure!(
-                virtiofs::control::install(handle),
-                "the virtio-fs control handle was already installed with another value"
-            );
+            virtiofs::control::install(spec)
+                .map_err(|reason| anyhow::anyhow!("{reason}"))?;
         }
         let control_broker_config = control_console
             .as_ref()
