@@ -221,7 +221,7 @@ impl WhpTimeAbi {
         }
         *extended_exits |= exits;
 
-        let cpuid_exits = cpuid_exits(&config.cpuid);
+        let mut cpuid_exits = cpuid_exits(&config.cpuid);
         whp_config
             .set_property(whp::PartitionProperty::CpuidExitList(&cpuid_exits))
             .map_err(|err| routing_error(format!("cannot set the CPUID exit list: {err}")))?;
@@ -272,17 +272,38 @@ impl WhpTimeAbi {
                 )
             })?;
         let cpuid_results = cpuid_results(&config.cpuid);
-        whp_config
-            .set_property(whp::PartitionProperty::CpuidResultList2(&cpuid_results))
-            .map_err(|err| {
-                TimeAbiError::new(
+        match whp_config.set_property(whp::PartitionProperty::CpuidResultList2(&cpuid_results)) {
+            Ok(_) => {}
+            Err(err)
+                if err == whp::WHvError::WHV_E_UNKNOWN_PROPERTY
+                    && whp::capabilities::legacy_cpuid() =>
+            {
+                // The old API cannot represent subleaf-specific masked
+                // results. Route every programmed leaf through the existing
+                // CPUID handler instead. Keep native feature-bank and time
+                // validation intact; do not approximate the table with the
+                // older, leaf-only CpuidResultList.
+                cpuid_exits = legacy_cpuid_exits(&config.cpuid);
+                whp_config
+                    .set_property(whp::PartitionProperty::CpuidExitList(&cpuid_exits))
+                    .map_err(|err| {
+                        routing_error(format!("cannot enable legacy CPUID exits: {err}"))
+                    })?;
+                tracing::warn!(
+                    leaves = cpuid_exits.len(),
+                    "WHP lacks CpuidResultList2; serving programmed CPUID leaves through exits"
+                );
+            }
+            Err(err) => {
+                return Err(TimeAbiError::new(
                     TimeAbiCode::CpuSurface,
                     format!(
                         "cannot program the {} CPUID results of the effective CPUID: {err}",
                         cpuid_results.len()
                     ),
-                )
-            })?;
+                ));
+            }
+        }
 
         let msr_exits = whp::capabilities::x64_msr_exit_bitmap()
             .map_err(|err| routing_error(format!("cannot query the MSR exits: {err}")))?;
@@ -458,6 +479,21 @@ pub(crate) fn cpuid_exits(config: &CpuidLeafSet) -> Vec<u32> {
         .leaves()
         .iter()
         .filter(|leaf| must_exit(leaf.function) && !is_zero_fill(leaf))
+        .map(|leaf| leaf.function)
+        .collect();
+    exits.sort_unstable();
+    exits.dedup();
+    exits
+}
+
+/// The legacy path routes every programmed non-sentinel leaf to the same
+/// handler as modern WHP's per-vCPU leaves. Zero sentinels remain native and
+/// are still verified during preflight.
+fn legacy_cpuid_exits(config: &CpuidLeafSet) -> Vec<u32> {
+    let mut exits: Vec<u32> = config
+        .leaves()
+        .iter()
+        .filter(|leaf| !is_zero_fill(leaf))
         .map(|leaf| leaf.function)
         .collect();
     exits.sort_unstable();
@@ -1476,6 +1512,30 @@ mod tests {
     use vm_topology::processor::x86::X2ApicState;
 
     const VP_COUNT: u32 = 8;
+
+    #[test]
+    fn legacy_exits_present_profile_without_native_result_table() {
+        for profile in test_cpuid::PROFILES {
+            let mut partition = Partition::new(profile, VP_COUNT, X2ApicState::Unsupported);
+            partition.exits = legacy_cpuid_exits(&partition.config);
+            let own = test_cpuid::own_cpuid(&partition.topology, &|function, index| {
+                partition.whp.native(function, index)
+            });
+            partition.cpuid = partition_cpuid(own, &partition.config, &partition.exits).unwrap();
+            partition.whp.results.clear();
+            check_cpuid_delivery(&partition.cpuid, &partition.exits).unwrap();
+            let record = CpuidLeafSet::new(partition.record());
+            let differences = test_cpuid::differences(&record, &partition.effective);
+            assert!(differences.is_empty(), "{profile}: {differences:#?}");
+            for vp in partition.topology.vps_arch() {
+                assert_eq!(
+                    partition.observe(vp.apic_id, 1, 0)[1] >> 24,
+                    vp.apic_id,
+                    "{profile}",
+                );
+            }
+        }
+    }
 
     /// WHP's own results on an Intel host without synthetic features: no
     /// hypervisor leaves, and every time bit wrong.

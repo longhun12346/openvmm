@@ -10,6 +10,8 @@
 pub mod abi;
 mod api;
 mod arm64;
+#[cfg(target_arch = "x86_64")]
+mod legacy_cpuid;
 mod partition_prop;
 mod x64;
 
@@ -33,6 +35,12 @@ use std::ptr::null_mut;
 use windows_sys::Win32::Foundation::ERROR_BAD_PATHNAME;
 use windows_sys::Win32::Foundation::LUID;
 use windows_sys::Win32::System::Power::DEVICE_POWER_STATE;
+
+/// Entry point for the isolated, opt-in legacy WHP CPUID probe process.
+#[cfg(target_arch = "x86_64")]
+pub fn run_legacy_cpuid_probe() -> std::io::Result<()> {
+    legacy_cpuid::process::run()
+}
 
 /// Functions to get the WHP platform's capabilities.
 pub mod capabilities {
@@ -161,6 +169,17 @@ pub mod capabilities {
     }
     pub fn reset_partition() -> bool {
         api::is_supported::WHvResetPartition()
+    }
+
+    /// Whether WHP can populate and pin GPA ranges.
+    pub fn gpa_range_advice() -> bool {
+        api::is_supported::WHvAdviseGpaRange()
+    }
+
+    /// Whether the experimental legacy x86 WHP compatibility path is enabled.
+    #[cfg(target_arch = "x86_64")]
+    pub fn legacy_cpuid() -> bool {
+        legacy_cpuid::enabled()
     }
 }
 
@@ -296,7 +315,11 @@ impl PartitionConfig {
             check_hresult(api::WHvCreatePartition(&mut handle))?;
         }
         Ok(PartitionConfig {
-            partition: Partition { handle },
+            partition: Partition {
+                handle,
+                #[cfg(target_arch = "x86_64")]
+                legacy_cpuid: Default::default(),
+            },
         })
     }
 
@@ -319,6 +342,8 @@ impl PartitionConfig {
 #[derive(Debug)]
 pub struct Partition {
     handle: abi::WHV_PARTITION_HANDLE,
+    #[cfg(target_arch = "x86_64")]
+    legacy_cpuid: parking_lot::Mutex<legacy_cpuid::Compatibility>,
 }
 
 impl Drop for Partition {
@@ -523,8 +548,11 @@ impl Partition {
                 data.0,
                 data.1,
                 data.2,
-            ))
+            ))?;
         }
+        #[cfg(target_arch = "x86_64")]
+        self.legacy_cpuid.lock().record(property);
+        Ok(())
     }
 
     fn get_property<T: partition_prop::AssociatedType>(&self, code: T) -> Result<T::Type>
@@ -606,13 +634,26 @@ impl Partition {
                     flags,
                 ))
             } else {
-                check_hresult(api::WHvMapGpaRange(
+                let result = check_hresult(api::WHvMapGpaRange(
                     self.handle,
                     data.cast(),
                     addr,
                     size as u64,
                     flags,
-                ))
+                ));
+                #[cfg(target_arch = "x86_64")]
+                if result.is_err() && legacy_cpuid::enabled() {
+                    use windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION;
+                    use windows_sys::Win32::System::Memory::VirtualQuery;
+                    let mut info = std::mem::zeroed::<MEMORY_BASIC_INFORMATION>();
+                    if VirtualQuery(data.cast(), &mut info, size_of_val(&info)) != 0 {
+                        eprintln!(
+                            "legacy WHP map failure: gpa={addr:#x}, size={size:#x}, host={data:p}, state={:#x}, protect={:#x}, type={:#x}, region={:#x}",
+                            info.State, info.Protect, info.Type, info.RegionSize,
+                        );
+                    }
+                }
+                result
             }
         }
     }
@@ -631,6 +672,9 @@ impl Partition {
             Flags: flags,
             AccessType: access_type,
         };
+        if !capabilities::gpa_range_advice() {
+            return Err(WHvError::ERROR_NOT_SUPPORTED);
+        }
         unsafe {
             check_hresult(api::WHvAdviseGpaRange(
                 self.handle,
@@ -645,6 +689,9 @@ impl Partition {
     }
 
     pub fn pin_ranges(&self, ranges: &[abi::WHV_MEMORY_RANGE_ENTRY]) -> Result<()> {
+        if !capabilities::gpa_range_advice() {
+            return Err(WHvError::ERROR_NOT_SUPPORTED);
+        }
         unsafe {
             check_hresult(api::WHvAdviseGpaRange(
                 self.handle,
@@ -658,6 +705,9 @@ impl Partition {
     }
 
     pub fn unpin_ranges(&self, ranges: &[abi::WHV_MEMORY_RANGE_ENTRY]) -> Result<()> {
+        if !capabilities::gpa_range_advice() {
+            return Err(WHvError::ERROR_NOT_SUPPORTED);
+        }
         unsafe {
             check_hresult(api::WHvAdviseGpaRange(
                 self.handle,
@@ -776,7 +826,21 @@ impl Partition {
     }
 
     pub fn physical_address_width(&self) -> Result<u32> {
-        self.get_property(partition_prop::PhysicalAddressWidth)
+        match self.get_property(partition_prop::PhysicalAddressWidth) {
+            #[cfg(target_arch = "x86_64")]
+            Err(WHvError::WHV_E_UNKNOWN_PROPERTY) if legacy_cpuid::enabled() => {
+                let vp = self.vp(0);
+                if vp.get_cpuid_output(0x80000000, 0)?.Eax < 0x80000008 {
+                    return Err(WHvError::ERROR_NOT_SUPPORTED);
+                }
+                let width = vp.get_cpuid_output(0x80000008, 0)?.Eax & 0xff;
+                if !(32..=52).contains(&width) {
+                    return Err(WHvError::ERROR_NOT_SUPPORTED);
+                }
+                Ok(width)
+            }
+            result => result,
+        }
     }
 
     #[expect(clippy::missing_safety_doc)]
@@ -1696,6 +1760,13 @@ impl<'a> Processor<'a> {
     }
 
     pub fn get_cpuid_output(&self, eax: u32, ecx: u32) -> Result<abi::WHV_CPUID_OUTPUT> {
+        #[cfg(target_arch = "x86_64")]
+        if !api::is_supported::WHvGetVirtualProcessorCpuidOutput() {
+            if !legacy_cpuid::enabled() {
+                return Err(WHvError::ERROR_NOT_SUPPORTED);
+            }
+            return self.partition.legacy_cpuid.lock().query(self, eax, ecx);
+        }
         unsafe {
             let mut output = std::mem::zeroed();
             check_hresult(api::WHvGetVirtualProcessorCpuidOutput(
@@ -1721,7 +1792,11 @@ impl MigrationHandle {
                 self.0.as_raw_handle(),
                 &mut handle,
             ))?;
-            Ok(MigratingPartition(Partition { handle }))
+            Ok(MigratingPartition(Partition {
+                handle,
+                #[cfg(target_arch = "x86_64")]
+                legacy_cpuid: Default::default(),
+            }))
         }
     }
 }

@@ -18,6 +18,25 @@ suitable for both OpenVMM and OpenHCL development.
 You must be running a recent version of Windows 11. Windows 10 is no longer
 supported as a development platform, due to needed WHP APIs.
 
+### Local Windows 10 compatibility experiment
+
+This checkout contains an experimental x86 WHP path enabled by
+`OPENVMM_WHP_LEGACY_CPUID=1`. It queries CPUID using a separate bounded probe
+process and partition when `WHvGetVirtualProcessorCpuidOutput` is missing.
+Build `whp-legacy-cpuid-probe` from the `whp` package alongside `openvmm`, or
+set `OPENVMM_WHP_CPUID_HELPER` to its path. The separate process avoids older
+WHP versions rejecting a second mapped partition within one process. For microVM
+time-ABI partitions without `CpuidResultList2`, programmed CPUID leaves exit
+to the existing software handler. The CPU-profile and time-ABI checks still
+apply. Missing `WHvAdviseGpaRange` disables user-mode memory faults and their
+dependent memory optimizations.
+
+This experiment targets ordinary microVM cold boots with up to eight vCPUs,
+without nested virtualization, synthetic processor features, or device
+assignment. It does not establish Windows 10 support or qualify snapshots,
+migration, or every CPU state. Use a separate build directory and retain the
+release binary when evaluating it.
+
 ```admonish note title="Recommended: Windows 11 26H1"
 For the best OpenHCL development experience, we recommend running a
 **Windows 11 26H1** Insider flight (build 28000+) if it is available for your
