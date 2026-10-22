@@ -218,21 +218,50 @@ pub(crate) fn reply(result: Result<(), String>) -> String {
 /// channel. It is set once, before the VM starts, and never replaced; the final
 /// step of the P4 work threads it through the resource graph instead, once the
 /// PoC trigger next to it is deleted.
-static ENDPOINT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+/// Where the launcher asked this VMM to serve export requests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Endpoint {
+    /// A handle inherited from the launcher; the value is the descriptor number
+    /// this process sees.
+    Inherited(u32),
+    /// A named pipe the launcher created; this process connects as a client.
+    Named(String),
+}
 
-/// Installs the inherited handle for this process. Returns false when one was
-/// already installed with a different value, which would mean two mutually
-/// exclusive launch modes were requested.
-pub fn install(handle: u32) -> bool {
-    match ENDPOINT.set(handle) {
-        Ok(()) => true,
-        Err(_) => ENDPOINT.get().copied() == Some(handle),
+impl Endpoint {
+    /// Parses the value of `--microvm-virtiofs-control`, which `nvx-rs` renders the
+    /// same way on the launcher side.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let text = text.trim();
+        if let Some(name) = text.strip_prefix("name=") {
+            if !name.starts_with(r"\\.\pipe\") {
+                return Err(format!("pipe name must start with \\\\.\\pipe\\: {name:?}"));
+            }
+            return Ok(Self::Named(name.to_owned()));
+        }
+        text.parse::<u32>()
+            .map(Self::Inherited)
+            .map_err(|_| format!("endpoint {text:?} is neither a handle number nor name=..."))
     }
 }
 
-/// The installed handle, if the launcher asked for this channel.
-pub(crate) fn installed() -> Option<u32> {
-    ENDPOINT.get().copied()
+static ENDPOINT: std::sync::OnceLock<Endpoint> = std::sync::OnceLock::new();
+
+/// Installs the endpoint for this process. Returns false when one was already
+/// installed with a different value, which would mean two mutually exclusive launch
+/// modes were requested.
+pub fn install(spec: &str) -> Result<(), String> {
+    let endpoint = Endpoint::parse(spec)?;
+    match ENDPOINT.set(endpoint.clone()) {
+        Ok(()) => Ok(()),
+        Err(_) if ENDPOINT.get() == Some(&endpoint) => Ok(()),
+        Err(_) => Err(format!("another endpoint was already installed: {ENDPOINT:?}")),
+    }
+}
+
+/// The installed endpoint, if the launcher asked for this channel.
+pub(crate) fn installed() -> Option<&'static Endpoint> {
+    ENDPOINT.get()
 }
 
 /// Serves export requests on the installed handle, if the launcher passed one.
@@ -242,26 +271,25 @@ pub(crate) fn installed() -> Option<u32> {
 /// owner. Nothing here authenticates the peer beyond the pipe itself; ordering and
 /// generation checks are in [`Ordering`].
 #[cfg(target_os = "windows")]
-#[expect(
-    unsafe_code,
-    reason = "adopting the inherited pipe handle the launcher passed; the handle is \
-              owned by this process for the life of the VM"
-)]
 pub(crate) fn start_if_installed(fs: &crate::VirtioFs) {
     use std::io::Read;
     use std::io::Write;
-    use std::os::windows::io::FromRawHandle;
 
-    let Some(handle) = installed() else {
+    let Some(endpoint) = installed() else {
         return;
     };
+    let endpoint = endpoint.clone();
     let weak: std::sync::Weak<crate::VirtioFsInner> = std::sync::Arc::downgrade(&fs.inner);
     let spawned = std::thread::Builder::new()
         .name("nvx-virtiofs-control".into())
         .spawn(move || {
-            // SAFETY: the launcher passes this handle to this process exactly once
-            // and keeps the other end open for the life of the VM.
-            let mut pipe = unsafe { std::fs::File::from_raw_handle(handle as _) };
+            let mut pipe = match open_endpoint(&endpoint) {
+                Ok(pipe) => pipe,
+                Err(error) => {
+                    tracing::error!(%error, ?endpoint, "cannot open the virtio-fs control endpoint");
+                    return;
+                }
+            };
             let mut ordering: Option<Ordering> = None;
             loop {
                 let mut length = [0u8; 4];
@@ -302,6 +330,42 @@ pub(crate) fn start_if_installed(fs: &crate::VirtioFs) {
         });
     if let Err(error) = spawned {
         tracing::error!(%error, "failed to start the virtio-fs control channel");
+    }
+}
+
+/// Opens the channel for `endpoint`.
+///
+/// The inherited form adopts the handle the launcher passed; the named form connects
+/// to the pipe it created, which needs no handle to outlive the VM. A named pipe
+/// connects through ordinary file system calls, so only the inherited form is unsafe.
+#[expect(
+    unsafe_code,
+    reason = "the inherited form adopts the handle the launcher passed; it is owned by \
+              this process for the life of the VM"
+)]
+fn open_endpoint(endpoint: &Endpoint) -> std::io::Result<std::fs::File> {
+    match endpoint {
+        Endpoint::Inherited(handle) => {
+            use std::os::windows::io::FromRawHandle;
+            // SAFETY: the launcher passes this handle to this process exactly once
+            // and keeps the other end open for the life of the VM.
+            Ok(unsafe { std::fs::File::from_raw_handle(*handle as _) })
+        }
+        Endpoint::Named(name) => {
+            // The launcher creates the pipe before starting this process, but a busy
+            // scheduler can still lose that race, so retry briefly.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                match std::fs::OpenOptions::new().read(true).write(true).open(name) {
+                    Ok(pipe) => return Ok(pipe),
+                    Err(error) if std::time::Instant::now() < deadline => {
+                        let _ = error;
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
     }
 }
 
