@@ -420,6 +420,29 @@ mod tests {
     }
 
     #[test]
+    fn the_launcher_wire_vectors_parse_the_same_way() {
+        // The same literals appear in `nvx-rs`'s `host::control::WIRE_VECTORS`,
+        // which asserts them as encoder output, so a framing change on either side
+        // fails both tests instead of silently breaking the channel.
+        let add = parse(
+            "gen=7 seq=1 session=session%20a mount=refs op=add child=mount0 mode=ro path=C:\\%20a",
+        )
+        .unwrap();
+        assert_eq!(add.generation, 7);
+        assert_eq!(add.sequence, 1);
+        assert_eq!(add.session, "session a");
+        assert_eq!(add.mount_id, "refs");
+        assert_eq!(add.child, "mount0");
+        assert_eq!(add.operation, Operation::Add);
+        assert!(add.mode.is_read_only());
+        assert_eq!(add.host_path, "C:\\ a");
+
+        let remove = parse("gen=7 seq=2 session=s mount=refs op=remove child=mount0").unwrap();
+        assert_eq!(remove.operation, Operation::Remove);
+        assert!(remove.host_path.is_empty());
+    }
+
+    #[test]
     fn malformed_requests_are_refused() {
         for payload in [
             "",
