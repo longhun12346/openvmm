@@ -14,6 +14,7 @@ otel = ["dep:otel_tracing"]
 ttrpc = []
 
 [dependencies]
+virtiofs = { workspace = true }
 chipset_resources.workspace = true
 chipset_device_worker_defs.workspace = true
 cpu_profile.workspace = true
