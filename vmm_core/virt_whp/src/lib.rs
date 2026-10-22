@@ -982,8 +982,14 @@ impl virt::Hypervisor for Whp {
 
     fn new_partition<'a>(
         &mut self,
-        config: ProtoPartitionConfig<'a>,
+        mut config: ProtoPartitionConfig<'a>,
     ) -> Result<WhpProtoPartition<'a>, Error> {
+        if config.user_mode_memory_faults && !whp::capabilities::gpa_range_advice() {
+            tracing::warn!(
+                "WHP lacks WHvAdviseGpaRange; using committed memory without user-mode GPA faults"
+            );
+            config.user_mode_memory_faults = false;
+        }
         let isolation = config.isolation.isolation_type();
         if !matches!(isolation, IsolationType::None | IsolationType::Vbs) {
             return Err(Error::IsolationNotSupported(isolation));
