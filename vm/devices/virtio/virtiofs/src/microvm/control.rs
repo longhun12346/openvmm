@@ -285,63 +285,85 @@ pub(crate) fn start_if_installed(fs: &crate::VirtioFs) {
     let spawned = std::thread::Builder::new()
         .name("nvx-virtiofs-control".into())
         .spawn(move || {
-            let mut pipe = match open_endpoint(&endpoint) {
-                Ok(pipe) => pipe,
-                Err(error) => {
-                    tracing::error!(%error, ?endpoint, "cannot open the virtio-fs control endpoint");
-                    return;
-                }
-            };
-            tracing::info!("virtio-fs export control: endpoint open, serving");
+            // One connection per exchange: the launcher connects for each request, so the
+            // server must accept again after every client hangs up. Serving a single
+            // connection would make the second request fail with "cannot reach the export
+            // channel".
             let mut ordering: Option<Ordering> = None;
             loop {
-                let mut length = [0u8; 4];
-                if pipe.read_exact(&mut length).is_err() {
-                    return;
-                }
-                let length = u32::from_le_bytes(length) as usize;
-                if length == 0 || length > MAX_FRAME_BYTES {
-                    let _ = pipe.write_all(
-                        format!("{}\n", reply(Err(format!("frame length {length} is out of range"))))
-                            .as_bytes(),
-                    );
-                    return;
-                }
-                let mut payload = vec![0u8; length];
-                if pipe.read_exact(&mut payload).is_err() {
-                    return;
-                }
-                let result = match String::from_utf8(payload) {
-                    Err(_) => Err("frame is not valid UTF-8".to_owned()),
-                    Ok(text) => match parse(&text) {
-                        Err(error) => Err(error),
-                        Ok(request) => {
-                            let guard = ordering
-                                .get_or_insert_with(|| Ordering::new(request.generation));
-                            match guard.accept(request.generation, request.sequence) {
-                                Err(error) => Err(error),
-                                Ok(()) => apply(&weak, &request),
-                            }
-                        }
-                    },
+                let mut pipe = match open_endpoint(&endpoint) {
+                    Ok(pipe) => pipe,
+                    Err(error) => {
+                        tracing::error!(%error, ?endpoint, "cannot open the virtio-fs control endpoint");
+                        return;
+                    }
                 };
-                // The reply is framed exactly like a request — `[u32 LE length][payload]` —
-                // because the launcher reads a length before the payload. Writing the bare
-                // line made every exchange wait for bytes that never came.
-                let line = format!("{}\n", reply(result));
-                let mut frame = Vec::with_capacity(4 + line.len());
-                frame.extend_from_slice(&(line.len() as u32).to_le_bytes());
-                frame.extend_from_slice(line.as_bytes());
-                if pipe.write_all(&frame).is_err() {
-                    return;
-                }
-                if pipe.flush().is_err() {
+                if serve_connection(&mut pipe, &weak, &mut ordering).is_err() {
                     return;
                 }
             }
         });
     if let Err(error) = spawned {
         tracing::error!(%error, "failed to start the virtio-fs control channel");
+    }
+}
+
+/// Serves frames on one connection until the client hangs up.
+///
+/// Returns `Err` only when the server can no longer make progress, so the caller can
+/// tell "this client left" from "this channel is broken".
+fn serve_connection(
+    pipe: &mut std::fs::File,
+    weak: &std::sync::Weak<crate::VirtioFsInner>,
+    ordering: &mut Option<Ordering>,
+) -> Result<(), ()> {
+    use std::io::Read;
+    use std::io::Write;
+    tracing::info!("virtio-fs export control: endpoint open, serving");
+    loop {
+        let mut length = [0u8; 4];
+        if pipe.read_exact(&mut length).is_err() {
+            return Ok(());   // the client closed its end
+        }
+        let length = u32::from_le_bytes(length) as usize;
+        if length == 0 || length > MAX_FRAME_BYTES {
+            let line = format!(
+                "{}\n",
+                reply(Err(format!("frame length {length} is out of range")))
+            );
+            let mut frame = Vec::with_capacity(4 + line.len());
+            frame.extend_from_slice(&(line.len() as u32).to_le_bytes());
+            frame.extend_from_slice(line.as_bytes());
+            let _ = pipe.write_all(&frame);
+            return Ok(());
+        }
+        let mut payload = vec![0u8; length];
+        if pipe.read_exact(&mut payload).is_err() {
+            return Ok(());
+        }
+        let result = match String::from_utf8(payload) {
+            Err(_) => Err("frame is not valid UTF-8".to_owned()),
+            Ok(text) => match parse(&text) {
+                Err(error) => Err(error),
+                Ok(request) => {
+                    let guard = ordering.get_or_insert_with(|| Ordering::new(request.generation));
+                    match guard.accept(request.generation, request.sequence) {
+                        Err(error) => Err(error),
+                        Ok(()) => apply(weak, &request),
+                    }
+                }
+            },
+        };
+        // The reply is framed exactly like a request — `[u32 LE length][payload]` —
+        // because the launcher reads a length before the payload. Writing the bare
+        // line made every exchange wait for bytes that never came.
+        let line = format!("{}\n", reply(result));
+        let mut frame = Vec::with_capacity(4 + line.len());
+        frame.extend_from_slice(&(line.len() as u32).to_le_bytes());
+        frame.extend_from_slice(line.as_bytes());
+        if pipe.write_all(&frame).is_err() || pipe.flush().is_err() {
+            return Ok(());
+        }
     }
 }
 
