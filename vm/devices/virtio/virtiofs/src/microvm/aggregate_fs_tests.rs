@@ -213,15 +213,13 @@ fn children_can_be_added_and_removed_at_runtime() {
     assert_eq!(error(create(&fs, tools, "new")), lx::Error::EROFS);
     assert_eq!(Roots::entries(&roots.tools), ["file"]);
 
-    // Fixed children stay fixed, and a name or a host root backs one child.
+    // Fixed children stay fixed, and dynamic names remain unique.
     assert_eq!(fs.remove_microvm_child("work").unwrap_err(), lx::Error::EINVAL);
     assert_eq!(
         fs.remove_microvm_child("missing").unwrap_err(),
         lx::Error::ENOENT
     );
     fs.add_microvm_child("tools", &roots.tools, true, false, vec![], vec![], vec![])
-        .unwrap_err();
-    fs.add_microvm_child("again", &roots.tools, true, false, vec![], vec![], vec![])
         .unwrap_err();
     fs.add_microvm_child("fixed", &roots.work, false, false, vec![], vec![], vec![])
         .unwrap_err();
@@ -242,6 +240,32 @@ fn children_can_be_added_and_removed_at_runtime() {
         .unwrap();
     assert_eq!(list(&fs, root), ["tools2", "work"]);
     assert_eq!(read_node(&fs, lookup(&fs, "tools2/file").unwrap()), b"host");
+}
+
+#[test]
+fn independently_authorized_dynamic_roots_keep_policy_and_lifetime() {
+    let roots = Roots::new();
+    let fs = aggregate(&[Child::new("work", &roots.work, false)]);
+    fs.add_microvm_child("reader", &roots.tools, true, false, vec![], vec![], vec![])
+        .unwrap();
+    fs.add_microvm_child("writer", &roots.tools, false, false, vec![], vec![], vec![])
+        .unwrap();
+    let reader = lookup(&fs, "reader").unwrap();
+    let writer = lookup(&fs, "writer").unwrap();
+    assert_ne!(reader, writer);
+    assert_ne!(
+        lookup(&fs, "reader/file").unwrap(),
+        lookup(&fs, "writer/file").unwrap()
+    );
+    assert_eq!(error(create(&fs, reader, "forbidden")), lx::Error::EROFS);
+    create(&fs, writer, "authorized").unwrap();
+    assert_eq!(list(&fs, reader), ["authorized", "file"]);
+    fs.remove_microvm_child("writer").unwrap();
+    assert_eq!(error(lookup(&fs, "writer")), lx::Error::ENOENT);
+    assert_eq!(read_node(&fs, lookup(&fs, "reader/file").unwrap()), b"host");
+    assert_eq!(error(create(&fs, reader, "still-forbidden")), lx::Error::EROFS);
+    fs.remove_microvm_child("reader").unwrap();
+    assert_eq!(list(&fs, FUSE_ROOT_ID), ["work"]);
 }
 
 #[test]
