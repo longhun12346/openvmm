@@ -11540,6 +11540,8 @@ dependencies = [
  "criterion",
  "guid",
  "pal",
+ "parking_lot",
+ "test_with_tracing",
  "windows-sys 0.61.0",
 ]
 
