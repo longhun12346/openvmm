@@ -31,7 +31,7 @@ use windows_sys::Win32::System::Memory::VirtualFree;
 
 pub(crate) fn enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("OPENVMM_WHP_LEGACY_CPUID").is_some_and(|v| v == "1"))
+    *ENABLED.get_or_init(|| !api::is_supported::WHvGetVirtualProcessorCpuidOutput())
 }
 
 #[derive(Debug)]

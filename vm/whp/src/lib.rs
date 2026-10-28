@@ -11,6 +11,8 @@ pub mod abi;
 mod api;
 mod arm64;
 #[cfg(target_arch = "x86_64")]
+mod doorbell_probe;
+#[cfg(target_arch = "x86_64")]
 mod legacy_cpuid;
 mod partition_prop;
 mod x64;
@@ -36,9 +38,16 @@ use windows_sys::Win32::Foundation::ERROR_BAD_PATHNAME;
 use windows_sys::Win32::Foundation::LUID;
 use windows_sys::Win32::System::Power::DEVICE_POWER_STATE;
 
-/// Entry point for the isolated, opt-in legacy WHP CPUID probe process.
+/// Entry point for the isolated WHP probe process: by default the legacy CPUID
+/// probe, or the doorbell check when started with `--doorbell`.
 #[cfg(target_arch = "x86_64")]
 pub fn run_legacy_cpuid_probe() -> std::io::Result<()> {
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == doorbell_probe::ARGUMENT)
+    {
+        return doorbell_probe::run();
+    }
     legacy_cpuid::process::run()
 }
 
@@ -176,10 +185,25 @@ pub mod capabilities {
         api::is_supported::WHvAdviseGpaRange()
     }
 
-    /// Whether the experimental legacy x86 WHP compatibility path is enabled.
+    /// Whether this host's WHP lacks `WHvGetVirtualProcessorCpuidOutput`, so the
+    /// legacy x86 compatibility path is used.
     #[cfg(target_arch = "x86_64")]
     pub fn legacy_cpuid() -> bool {
         legacy_cpuid::enabled()
+    }
+
+    /// Whether doorbell events can be registered on this host without
+    /// terminating the process. Hosts without notification ports are probed in
+    /// the helper process the first time this is called.
+    pub fn doorbell_events() -> bool {
+        #[cfg(target_arch = "x86_64")]
+        {
+            doorbell_probe::usable()
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            true
+        }
     }
 }
 
