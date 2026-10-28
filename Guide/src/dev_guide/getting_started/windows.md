@@ -20,11 +20,14 @@ supported as a development platform, due to needed WHP APIs.
 
 ### Local Windows 10 compatibility experiment
 
-This checkout contains an experimental x86 WHP path enabled by
-`OPENVMM_WHP_LEGACY_CPUID=1`. It queries CPUID using a separate bounded probe
-process and partition when `WHvGetVirtualProcessorCpuidOutput` is missing.
-Build `whp-legacy-cpuid-probe` from the `whp` package alongside `openvmm`, or
-set `OPENVMM_WHP_CPUID_HELPER` to its path. The separate process avoids older
+This checkout contains an experimental x86 WHP path that is used automatically
+when `WHvGetVirtualProcessorCpuidOutput` is missing. It queries CPUID using a
+separate bounded probe process and partition. Build `whp-legacy-cpuid-probe`
+from the `whp` package alongside `openvmm`, or set `OPENVMM_WHP_CPUID_HELPER` to
+its path. On hosts without `WHvCreateNotificationPort`, the same helper is also
+run once (`--doorbell`) to check whether registering doorbell events at two
+different addresses terminates the process, as it does on some Windows 10
+builds; doorbell events are disabled if it does, or if the helper cannot run. The separate process avoids older
 WHP versions rejecting a second mapped partition within one process. For microVM
 time-ABI partitions without `CpuidResultList2`, programmed CPUID leaves exit
 to the existing software handler. The CPU-profile and time-ABI checks still
