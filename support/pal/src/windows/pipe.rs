@@ -45,6 +45,7 @@ use windows_sys::Win32::Foundation::GENERIC_WRITE;
 use windows_sys::Win32::Foundation::OBJ_CASE_INSENSITIVE;
 use windows_sys::Win32::Foundation::STATUS_NAME_TOO_LONG;
 use windows_sys::Win32::Foundation::STATUS_NOT_SUPPORTED;
+use windows_sys::Win32::Foundation::STATUS_PENDING;
 use windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::FILE_READ_DATA;
 use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
@@ -323,19 +324,14 @@ impl PipeExt for File {
             event_handle: event.as_handle().as_raw_handle() as usize as u64,
         };
         unsafe {
-            let mut iosb = zeroed();
             let mut status = !0;
             // Newer versions of Windows support FSCTL_PIPE_EVENT_SELECT, which
             // works on unidirectional pipes. Older versions require
             // FSCTL_PIPE_EVENT_SELECT_OLD, which only works on bidirectional
             // pipes.
             for fsctl in [FSCTL_PIPE_EVENT_SELECT, FSCTL_PIPE_EVENT_SELECT_OLD] {
-                status = NtFsControlFile(
-                    self.as_raw_handle().cast::<c_void>(),
-                    null_mut(),
-                    None,
-                    null_mut(),
-                    &mut iosb,
+                status = pipe_fsctl(
+                    self.as_raw_handle(),
                     fsctl,
                     std::ptr::from_mut(&mut input).cast(),
                     size_of_val(&input) as u32,
@@ -355,13 +351,8 @@ impl PipeExt for File {
         unsafe {
             let mut handle_to_reset: u64 = 0;
             let mut events: u32 = 0;
-            let mut iosb = zeroed();
-            chk_status(NtFsControlFile(
-                self.as_raw_handle().cast::<c_void>(),
-                null_mut(),
-                None,
-                null_mut(),
-                &mut iosb,
+            chk_status(pipe_fsctl(
+                self.as_raw_handle(),
                 FSCTL_PIPE_EVENT_ENUM,
                 std::ptr::from_mut(&mut handle_to_reset).cast(),
                 size_of_val(&handle_to_reset) as u32,
@@ -406,6 +397,50 @@ impl PipeExt for File {
             return Err(io::Error::last_os_error());
         }
         Ok(())
+    }
+}
+
+/// Sends a pipe FSCTL and returns its final status.
+///
+/// A handle opened for overlapped IO may complete a request asynchronously: Windows 10 answers
+/// `STATUS_PENDING` for the request it does not support and reports `STATUS_NOT_SUPPORTED` only
+/// when the request completes. Reading that first status as success skipped the fallback to the
+/// older request and left the pipe with no event registered. The call therefore waits for the
+/// request, which also keeps the stack buffers alive until the driver is done with them.
+///
+/// # Safety
+///
+/// `input` and `output` must be valid for the given lengths.
+unsafe fn pipe_fsctl(
+    handle: RawHandle,
+    fsctl: u32,
+    input: *mut c_void,
+    input_len: u32,
+    output: *mut c_void,
+    output_len: u32,
+) -> i32 {
+    let event = Event::new();
+    // SAFETY: the buffers are valid per the caller, and this function does not return before the
+    // request completes.
+    unsafe {
+        let mut iosb = zeroed();
+        let mut status = NtFsControlFile(
+            handle.cast::<c_void>(),
+            event.as_handle().as_raw_handle().cast::<c_void>(),
+            None,
+            null_mut(),
+            &mut iosb,
+            fsctl,
+            input,
+            input_len,
+            output,
+            output_len,
+        );
+        if status == STATUS_PENDING {
+            event.wait();
+            status = iosb.Anonymous.Status;
+        }
+        status
     }
 }
 
