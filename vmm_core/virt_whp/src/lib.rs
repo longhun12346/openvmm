@@ -696,6 +696,9 @@ impl virt::Partition for WhpPartition {
         self: &Arc<Self>,
         minimum_vtl: Vtl,
     ) -> Option<Arc<dyn DoorbellRegistration>> {
+        if !whp::capabilities::doorbell_events() {
+            return None;
+        }
         Some(self.with_vtl(minimum_vtl).clone())
     }
 

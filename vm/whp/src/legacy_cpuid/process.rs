@@ -37,25 +37,30 @@ fn io_error(error: io::Error) -> WHvError {
     WHvError::ERROR_NOT_SUPPORTED
 }
 
+/// The path of the probe helper executable: `OPENVMM_WHP_CPUID_HELPER`, or
+/// `whp-legacy-cpuid-probe.exe` next to the running executable.
+pub(crate) fn helper_path() -> io::Result<std::path::PathBuf> {
+    match std::env::var_os("OPENVMM_WHP_CPUID_HELPER") {
+        Some(path) => Ok(path.into()),
+        None => {
+            let mut directory = std::env::current_exe()?;
+            directory.pop();
+            // Cargo's test executables live in the deps subdirectory.
+            if directory.file_name().is_some_and(|name| name == "deps") {
+                directory.pop();
+            }
+            Ok(directory.join("whp-legacy-cpuid-probe.exe"))
+        }
+    }
+}
+
 impl Client {
     pub(super) fn new(properties: &[(u32, SavedProperty)]) -> Result<Self> {
         Self::start(properties).map_err(io_error)
     }
 
     fn start(properties: &[(u32, SavedProperty)]) -> io::Result<Self> {
-        let path = match std::env::var_os("OPENVMM_WHP_CPUID_HELPER") {
-            Some(path) => path.into(),
-            None => {
-                let mut directory = std::env::current_exe()?;
-                directory.pop();
-                // Cargo's test executables live in the deps subdirectory.
-                if directory.file_name().is_some_and(|name| name == "deps") {
-                    directory.pop();
-                }
-                directory.join("whp-legacy-cpuid-probe.exe")
-            }
-        };
-        let mut child = Command::new(path)
+        let mut child = Command::new(helper_path()?)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
