@@ -226,10 +226,10 @@ fn children_can_be_added_and_removed_at_runtime() {
     assert_eq!(list(&fs, root), ["tools", "work"]);
 
     // The generic entry points still refuse a microVM aggregate.
-    assert_eq!(
-        fs.add_child("more", &roots.work, None).unwrap_err(),
-        lx::Error::EINVAL
-    );
+    match fs.add_child("more", &roots.work, None).unwrap_err() {
+        crate::CreateError::Filesystem(error) => assert_eq!(error, lx::Error::EINVAL),
+        other => panic!("unexpected error {other:?}"),
+    }
     assert_eq!(fs.remove_child("tools").unwrap_err(), lx::Error::EINVAL);
 
     // Removal hides the name from new lookups; the root can back a new child.
