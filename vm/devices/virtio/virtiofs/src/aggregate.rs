@@ -133,7 +133,8 @@ impl AggregateState {
     ///
     /// `identity` is the identity of the child's host root and
     /// `static_identities` are those of the children that were fixed when the
-    /// aggregate was created; a host root may back only one child. `build`
+    /// aggregate was created. Dynamic children may independently authorize the
+    /// same host root; each keeps its own volume identity and policy. `build`
     /// opens the child's volume as the volume ID that it receives. It runs
     /// under the registry's write lock, so that a concurrent addition cannot
     /// take the ID, and a lookup in the synthetic root waits for it.
@@ -158,12 +159,8 @@ impl AggregateState {
             "the microVM aggregate already has a child named '{name}'"
         );
         anyhow::ensure!(
-            !static_identities.contains(&identity)
-                && !registry
-                    .entries
-                    .iter()
-                    .any(|e| e.dynamic_identity.as_deref() == Some(identity)),
-            "the host root of child '{name}' already backs another child"
+            !static_identities.contains(&identity),
+            "the host root of child '{name}' already backs a fixed child"
         );
         let volume_id = registry.next_volume_id;
         let next_volume_id = volume_id
