@@ -272,9 +272,6 @@ pub(crate) fn installed() -> Option<&'static Endpoint> {
 /// generation checks are in [`Ordering`].
 #[cfg(target_os = "windows")]
 pub(crate) fn start_if_installed(fs: &crate::VirtioFs) {
-    use std::io::Read;
-    use std::io::Write;
-
     let Some(endpoint) = installed() else {
         tracing::info!("virtio-fs export control: no endpoint installed");
         return;
